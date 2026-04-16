@@ -15,10 +15,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch tags
-        run: |
-          git fetch --tags --force  # Retrieve annotated tags.
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -31,14 +27,3 @@ jobs:
       - name: Test
         run: |
           make test
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bin
-          path: bin/
-
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: bin/*
