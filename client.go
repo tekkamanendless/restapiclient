@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -86,6 +87,16 @@ func defaultErrorFunction(response *http.Response) error {
 //
 // If `output` is provided, it will be deserialized based on the response Content-Type header.
 // If `output` is `RawBytes`, then the contents will be returned as-is.
+//
+// If the HTTP status code is non-2xx, then the an httperror.Error will be returned.
+// You can customize the exact error by specifying an ErrorFunction using OptionErrorFunction.
+// This will allow you to parse the response body and return a more specific error.
+//
+// Consider wrapping that custom error in an httperror.Error to make it easier to handle.
+//
+//	httpErr := httperror.ErrorFromStatus(response.StatusCode)
+//	yourErr := ...
+//	return fmt.Errorf("%w: %w", httpErr, yourErr)
 func (c *Client) Do(ctx context.Context, method string, path string, input any, output any, options ...Option) error {
 	requestConfig := RequestConfig{
 		Header:          http.Header{},
@@ -174,6 +185,60 @@ func (c *Client) Do(ctx context.Context, method string, path string, input any, 
 		}
 	}
 
+	if dumpDirectory := os.Getenv("RESTAPICLIENT_DUMP_DIRECTORY"); dumpDirectory != "" {
+		filename := fmt.Sprintf("%d_%s_%s", time.Now().Unix(), method, targetURL)
+		{
+			reg, _ := regexp.Compile("[^a-zA-Z0-9_ -]+")
+			filename = reg.ReplaceAllString(filename, "_")
+
+			if len(filename) > 200 {
+				filename = filename[:200]
+			}
+		}
+
+		{
+			dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".request.head"
+			dumpContents, err := httputil.DumpRequest(request, false)
+			if err != nil {
+				// Oh well.
+				slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump request to %q: %v", dumpFile, err))
+			}
+
+			if dumpDirectory == "-" {
+				fmt.Fprintf(os.Stderr, "%s\n", string(dumpContents))
+			} else {
+				err = os.WriteFile(dumpFile, dumpContents, 0644)
+				if err != nil {
+					// Oh well.
+					slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump request contents to %q: %v", dumpFile, err))
+				}
+			}
+		}
+		{
+			if request.Body != nil {
+				requestBody, err := io.ReadAll(request.Body)
+				if err != nil {
+					// Oh well.
+					slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not read request body: %v", err))
+				} else {
+					// Restore the request body so the next request can use it.
+					request.Body = io.NopCloser(bytes.NewReader(requestBody))
+
+					if dumpDirectory == "-" {
+						fmt.Fprintf(os.Stderr, "%s\n", string(requestBody))
+					} else {
+						dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".request.body"
+						err = os.WriteFile(dumpFile, requestBody, 0644)
+						if err != nil {
+							// Oh well.
+							slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump request contents to %q: %v", dumpFile, err))
+						}
+					}
+				}
+			}
+		}
+	}
+
 	slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Making request: %s %s %v", method, targetURL, request.Header))
 	response, err := requestConfig.HTTPClient.Do(request)
 	if err != nil {
@@ -190,13 +255,39 @@ func (c *Client) Do(ctx context.Context, method string, path string, input any, 
 		{
 			reg, _ := regexp.Compile("[^a-zA-Z0-9_ -]+")
 			filename = reg.ReplaceAllString(filename, "_")
+
+			if len(filename) > 200 {
+				filename = filename[:200]
+			}
 		}
 
-		dumpFile := dumpDirectory + string(filepath.Separator) + filename
-		err = os.WriteFile(dumpFile, contents, 0644)
-		if err != nil {
-			// Oh well.
-			slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump contents to %q: %v", dumpFile, err))
+		{
+			dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".response.head"
+			dumpContents, err := httputil.DumpResponse(response, false)
+			if err != nil {
+				// Oh well.
+				slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump response to %q: %v", dumpFile, err))
+			}
+
+			if dumpDirectory == "-" {
+				fmt.Fprintf(os.Stderr, "%s\n", string(dumpContents))
+			} else {
+				err = os.WriteFile(dumpFile, dumpContents, 0644)
+				if err != nil {
+					// Oh well.
+					slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump response contents to %q: %v", dumpFile, err))
+				}
+			}
+		}
+		if dumpDirectory == "-" {
+			fmt.Fprintf(os.Stderr, "%s\n", string(contents))
+		} else {
+			dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".response.body"
+			err = os.WriteFile(dumpFile, contents, 0644)
+			if err != nil {
+				// Oh well.
+				slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump response contents to %q: %v", dumpFile, err))
+			}
 		}
 	}
 
