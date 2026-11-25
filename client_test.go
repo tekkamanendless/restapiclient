@@ -5,12 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tekkamanendless/httperror"
@@ -27,6 +33,8 @@ func (e *ErrorResponse) Error() string {
 
 func TestClient(t *testing.T) {
 	ctx := context.Background()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	testUsername := "testuser"
 	testPassword := "testpassword"
@@ -94,7 +102,7 @@ func TestClient(t *testing.T) {
 			return
 		case "/public/error":
 			switch r.Method {
-			case http.MethodGet:
+			case http.MethodDelete, http.MethodGet, http.MethodPatch, http.MethodPost, http.MethodPut:
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
 				w.Write([]byte(`{"code":1234,"message":"This is a custom error message."}`))
@@ -108,6 +116,48 @@ func TestClient(t *testing.T) {
 			case http.MethodGet:
 				w.Header().Set("Location", "/public/text")
 				w.WriteHeader(http.StatusTemporaryRedirect)
+				return
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			w.Write([]byte("Method Not Allowed"))
+			return
+		case "/public/temporary-error":
+			switch r.Method {
+			case http.MethodDelete, http.MethodGet, http.MethodPatch, http.MethodPost, http.MethodPut:
+				parsedURL, err := url.Parse(r.URL.String())
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte("Internal Server Error"))
+					return
+				}
+
+				if stringValue := parsedURL.Query().Get("fail_until"); stringValue != "" {
+					failUntil, err := time.Parse(time.RFC3339, stringValue)
+					if err != nil {
+						w.WriteHeader(http.StatusBadRequest)
+						w.Write([]byte(`{"code":1,"message":"Could not parse fail_until."}`))
+						return
+					}
+
+					failWith := http.StatusTooManyRequests
+					if stringValue := parsedURL.Query().Get("fail_with"); stringValue != "" {
+						intValue, err := strconv.Atoi(stringValue)
+						if err != nil {
+							w.WriteHeader(http.StatusBadRequest)
+							w.Write([]byte(`{"code":1,"message":"Could not parse fail_with."}`))
+							return
+						}
+						failWith = intValue
+					}
+
+					if time.Now().Before(failUntil) {
+						w.WriteHeader(failWith)
+						w.Write([]byte(http.StatusText(failWith)))
+						return
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("Success"))
 				return
 			}
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -141,8 +191,8 @@ func TestClient(t *testing.T) {
 	defer testServer.Close()
 
 	t.Run("Unauthenticated", func(t *testing.T) {
-		client := New(testServer.URL)
-		assert.Equal(t, client.BaseURL, testServer.URL)
+		client := New(OptionBaseURL(testServer.URL))
+		assert.Equal(t, client.Config().BaseURL, testServer.URL)
 
 		t.Run("Bogus path", func(t *testing.T) {
 			err := client.Do(ctx, http.MethodGet, "/bogus", nil, nil)
@@ -252,6 +302,38 @@ func TestClient(t *testing.T) {
 						assert.Equal(t, 1234, errorResponse.Code)
 						assert.Equal(t, "This is a custom error message.", errorResponse.Message)
 					}
+				})
+				t.Run("Backoff", func(t *testing.T) {
+					t.Run("No backoff", func(t *testing.T) {
+						err := client.Do(ctx, http.MethodGet, "/public/temporary-error?fail_until="+time.Now().Add(5*time.Second).Format(time.RFC3339)+"&fail_with="+strconv.Itoa(http.StatusTooManyRequests), nil, nil)
+						require.ErrorIs(t, err, httperror.ErrStatusTooManyRequests)
+					})
+					t.Run("Default backoff function", func(t *testing.T) {
+						err := client.Do(ctx, http.MethodGet, "/public/temporary-error?fail_until="+time.Now().Add(5*time.Second).Format(time.RFC3339)+"&fail_with="+strconv.Itoa(http.StatusTooManyRequests), nil, nil,
+							OptionBackOffIsPermanentErrorFunction(DefaultBackOffIsPermanentErrorFunction),
+						)
+						require.NoError(t, err)
+					})
+					t.Run("Default backoff function that doesn't apply", func(t *testing.T) {
+						err := client.Do(ctx, http.MethodGet, "/public/temporary-error?fail_until="+time.Now().Add(5*time.Second).Format(time.RFC3339)+"&fail_with="+strconv.Itoa(http.StatusNotFound), nil, nil,
+							OptionBackOffIsPermanentErrorFunction(DefaultBackOffIsPermanentErrorFunction),
+						)
+						require.ErrorIs(t, err, httperror.ErrStatusNotFound)
+					})
+					t.Run("Default backoff function without enough time", func(t *testing.T) {
+						err := client.Do(ctx, http.MethodGet, "/public/temporary-error?fail_until="+time.Now().Add(5*time.Second).Format(time.RFC3339)+"&fail_with="+strconv.Itoa(http.StatusTooManyRequests), nil, nil,
+							OptionBackOffIsPermanentErrorFunction(DefaultBackOffIsPermanentErrorFunction),
+							OptionBackOffOptions(backoff.WithMaxElapsedTime(1*time.Second)),
+						)
+						require.ErrorIs(t, err, httperror.ErrStatusTooManyRequests)
+					})
+					t.Run("Default backoff function without enough tries", func(t *testing.T) {
+						err := client.Do(ctx, http.MethodGet, "/public/temporary-error?fail_until="+time.Now().Add(5*time.Second).Format(time.RFC3339)+"&fail_with="+strconv.Itoa(http.StatusTooManyRequests), nil, nil,
+							OptionBackOffIsPermanentErrorFunction(DefaultBackOffIsPermanentErrorFunction),
+							OptionBackOffOptions(backoff.WithMaxTries(1)),
+						)
+						require.ErrorIs(t, err, httperror.ErrStatusTooManyRequests)
+					})
 				})
 			})
 			t.Run("JSON", func(t *testing.T) {
@@ -501,8 +583,8 @@ func TestClient(t *testing.T) {
 		})
 	})
 	t.Run("Authenticated", func(t *testing.T) {
-		client := New(testServer.URL).WithOptions(OptionBasicAuth(testUsername, testPassword))
-		assert.Equal(t, client.BaseURL, testServer.URL)
+		client := New(OptionBaseURL(testServer.URL), OptionBasicAuth(testUsername, testPassword))
+		assert.Equal(t, client.Config().BaseURL, testServer.URL)
 
 		t.Run("Bogus path", func(t *testing.T) {
 			err := client.Do(ctx, http.MethodGet, "/bogus", nil, nil)
@@ -518,8 +600,8 @@ func TestClient(t *testing.T) {
 		})
 	})
 	t.Run("Authenticated on the request itself", func(t *testing.T) {
-		client := New(testServer.URL)
-		assert.Equal(t, client.BaseURL, testServer.URL)
+		client := New(OptionBaseURL(testServer.URL))
+		assert.Equal(t, client.Config().BaseURL, testServer.URL)
 
 		t.Run("Private path", func(t *testing.T) {
 			err := client.Do(ctx, http.MethodGet, "/private/json", nil, nil, OptionBasicAuth(testUsername, testPassword))
@@ -527,8 +609,8 @@ func TestClient(t *testing.T) {
 		})
 	})
 	t.Run("WithOptions", func(t *testing.T) {
-		client := New(testServer.URL)
-		assert.Equal(t, client.BaseURL, testServer.URL)
+		client := New(OptionBaseURL(testServer.URL))
+		assert.Equal(t, client.Config().BaseURL, testServer.URL)
 
 		t.Run("Initial", func(t *testing.T) {
 			err := client.Do(ctx, http.MethodGet, "/public/json", nil, nil)
@@ -573,6 +655,144 @@ func TestClient(t *testing.T) {
 			assert.Equal(t, "value-6", output.Header.Get("header-2"))
 			assert.Equal(t, "value-3", output.Header.Get("header-3"))
 			assert.Equal(t, "value-4", output.Header.Get("header-4"))
+		})
+	})
+	t.Run("Dump request and response", func(t *testing.T) {
+		buildFileRequestMap := func(dumpDirectory string) map[string]map[string]string {
+			files, err := filepath.Glob(dumpDirectory + "/*.*")
+			require.NoError(t, err)
+
+			fileRequestMap := map[string]map[string]string{}
+			for _, file := range files {
+				fileName := filepath.Base(file)
+				parts := strings.SplitN(fileName, ".", 2)
+				require.Len(t, parts, 2)
+
+				requestName := parts[0]
+				fileSuffix := parts[1]
+				if _, ok := fileRequestMap[requestName]; !ok {
+					fileRequestMap[requestName] = map[string]string{}
+				}
+				fileRequestMap[requestName][fileSuffix] = file
+			}
+			return fileRequestMap
+		}
+
+		client := New(OptionBaseURL(testServer.URL))
+		assert.Equal(t, client.Config().BaseURL, testServer.URL)
+
+		t.Run("GET", func(t *testing.T) {
+			t.Run("Short URL", func(t *testing.T) {
+				t.Run("Directory", func(t *testing.T) {
+					dumpDirectory := t.TempDir()
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					err := client.Do(ctx, http.MethodGet, "/public/json", nil, nil)
+					require.NoError(t, err)
+
+					fileRequestMap := buildFileRequestMap(dumpDirectory)
+					require.Len(t, fileRequestMap, 1)
+					for _, fileMap := range fileRequestMap {
+						require.Len(t, fileMap, 3)
+						require.Contains(t, fileMap, "request.head")
+						require.Contains(t, fileMap, "response.head")
+						require.Contains(t, fileMap, "response.body")
+					}
+				})
+				t.Run("Stderr", func(t *testing.T) {
+					dumpDirectory := "-"
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					err := client.Do(ctx, http.MethodGet, "/public/json", nil, nil)
+					require.NoError(t, err)
+				})
+			})
+			t.Run("Long URL", func(t *testing.T) {
+				t.Run("Directory", func(t *testing.T) {
+					dumpDirectory := t.TempDir()
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					queryParams := url.Values{}
+					queryParams.Add("param1", strings.Repeat("x", 500))
+					assert.True(t, len(queryParams.Encode()) > 200)
+					err := client.Do(ctx, http.MethodGet, "/public/json?"+queryParams.Encode(), nil, nil)
+					require.NoError(t, err)
+
+					fileRequestMap := buildFileRequestMap(dumpDirectory)
+					require.Len(t, fileRequestMap, 1)
+					for _, fileMap := range fileRequestMap {
+						require.Len(t, fileMap, 3)
+						require.Contains(t, fileMap, "request.head")
+						require.Contains(t, fileMap, "response.head")
+						require.Contains(t, fileMap, "response.body")
+					}
+				})
+				t.Run("Stderr", func(t *testing.T) {
+					dumpDirectory := "-"
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					queryParams := url.Values{}
+					queryParams.Add("param1", strings.Repeat("x", 500))
+					assert.True(t, len(queryParams.Encode()) > 200)
+					err := client.Do(ctx, http.MethodGet, "/public/json?"+queryParams.Encode(), nil, nil)
+					require.NoError(t, err)
+				})
+			})
+		})
+		t.Run("POST", func(t *testing.T) {
+			t.Run("No body", func(t *testing.T) {
+				t.Run("Directory", func(t *testing.T) {
+					dumpDirectory := t.TempDir()
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					err := client.Do(ctx, http.MethodPost, "/public/json", nil, nil)
+					require.NoError(t, err)
+
+					fileRequestMap := buildFileRequestMap(dumpDirectory)
+					require.Len(t, fileRequestMap, 1)
+					for _, fileMap := range fileRequestMap {
+						require.Len(t, fileMap, 3)
+						require.Contains(t, fileMap, "request.head")
+						require.Contains(t, fileMap, "response.head")
+						require.Contains(t, fileMap, "response.body")
+					}
+				})
+				t.Run("Stderr", func(t *testing.T) {
+					dumpDirectory := "-"
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					err := client.Do(ctx, http.MethodPost, "/public/json", nil, nil)
+					require.NoError(t, err)
+				})
+			})
+			t.Run("Body", func(t *testing.T) {
+				t.Run("Directory", func(t *testing.T) {
+					dumpDirectory := t.TempDir()
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					input := "test"
+					err := client.Do(ctx, http.MethodPost, "/public/json", input, nil)
+					require.NoError(t, err)
+
+					fileRequestMap := buildFileRequestMap(dumpDirectory)
+					require.Len(t, fileRequestMap, 1)
+					for _, fileMap := range fileRequestMap {
+						require.Len(t, fileMap, 4)
+						require.Contains(t, fileMap, "request.head")
+						require.Contains(t, fileMap, "request.body")
+						require.Contains(t, fileMap, "response.head")
+						require.Contains(t, fileMap, "response.body")
+					}
+				})
+				t.Run("Stderr", func(t *testing.T) {
+					dumpDirectory := "-"
+					t.Setenv("RESTAPICLIENT_DUMP_DIRECTORY", dumpDirectory)
+
+					input := "test"
+					err := client.Do(ctx, http.MethodPost, "/public/json", input, nil)
+					require.NoError(t, err)
+				})
+			})
 		})
 	})
 }
