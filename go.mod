@@ -3,6 +3,7 @@ module github.com/tekkamanendless/restapiclient
 go 1.24.3
 
 require (
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/stretchr/testify v1.11.1
 	github.com/tekkamanendless/httperror v1.0.1
 )

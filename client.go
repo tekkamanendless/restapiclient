@@ -8,61 +8,56 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
-	"os"
-	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
-	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/tekkamanendless/httperror"
 )
 
-// Client is an client for a REST API.
+// Client is a client for a REST API.
+type Client interface {
+	Do(ctx context.Context, method string, path string, input any, output any, options ...Option) error
+	Config() RequestConfig
+	WithOptions(options ...Option) Client
+}
+
+// clientStruct is an client for a REST API.
 //
-// This will basically work with anything, including ours.
-type Client struct {
-	BaseURL    string      // This is the base URL; all paths will be appended to this.
-	Options    []Option    // This is a list of Options to apply, if any.
-	httpClient http.Client // This is used internally for making requests.
+// It will also work with any HTTP server.
+type clientStruct struct {
+	Options []Option // This is a list of Options to apply, if any.
 }
 
 // New returns a new Client.
-func New(baseURL string, options ...Option) *Client {
-	return &Client{
-		BaseURL: baseURL,
+func New(options ...Option) Client {
+	return &clientStruct{
 		Options: options,
 	}
 }
 
-// HTTPClient returns a pointer to the HTTP client that will be used for the next request.
-//
-// If no option overrides it, then the internal HTTP client will be returned.
-// Otherwise, the HTTP client from the option will be returned.
-//
-// You may alter this client, change its transport, etc.
-func (c *Client) HTTPClient() *http.Client {
+// Config returns the fully-realized RequestConfig for the Client.
+func (c *clientStruct) Config() RequestConfig {
 	requestConfig := RequestConfig{
-		Header:          http.Header{},
-		QueryParameters: url.Values{},
-		HTTPClient:      &c.httpClient,
+		BackOffIsPermanentErrorFunction: nil, // There is no permanent error function.
+		BackOffOptions:                  nil, // There are no backoff options.
+		BaseURL:                         "",  // There is no base URL.
+		Header:                          http.Header{},
+		QueryParameters:                 url.Values{},
+		HTTPClient:                      &http.Client{},
+		ErrorFunction:                   nil, // There is no custom error function.
 	}
 	for _, option := range c.Options {
 		option(&requestConfig)
 	}
-	if requestConfig.HTTPClient == nil {
-		requestConfig.HTTPClient = &c.httpClient
-	}
-	return requestConfig.HTTPClient
+	return requestConfig
 }
 
 // WithOptions returns a new Client with the given options already set.
-func (c *Client) WithOptions(options ...Option) *Client {
+func (c *clientStruct) WithOptions(options ...Option) Client {
 	// Create a new Client.
-	newClient := Client{
-		BaseURL: c.BaseURL,
+	newClient := clientStruct{
 		Options: make([]Option, 0, len(c.Options)+len(options)), // Allocate space for existing and new options.
 	}
 	// Copy the existing options.
@@ -82,13 +77,18 @@ func defaultErrorFunction(response *http.Response) error {
 //
 // The Client Options will be applied first, and then any Options given here will be applied.
 //
-// If `input` is provided, it will be serialized based on the Content-Type header.
-// If `input` is `RawBytes`, then it will be sent as-is.
+// If `input` is provided, it will be handled according to its type:
 //
-// If `output` is provided, it will be deserialized based on the response Content-Type header.
-// If `output` is `RawBytes`, then the contents will be returned as-is.
+//   - `restapiclient.RawBytes`: it will be sent as-is.
+//   - `url.Values`: it will be serialized as a URL-encoded string.
+//   - Any other type: it will be serialized based on the Content-Type header given to this function.
 //
-// If the HTTP status code is non-2xx, then the an httperror.Error will be returned.
+// If `output` is provided, it will be handled according to its type:
+//
+//   - `restapiclient.RawBytes`: the contents will be returned as-is.
+//   - Any other type: the contents will be deserialized based on the response Content-Type header from the server.
+//
+// If the HTTP status code is non-2xx, then an httperror.Error will be returned.
 // You can customize the exact error by specifying an ErrorFunction using OptionErrorFunction.
 // This will allow you to parse the response body and return a more specific error.
 //
@@ -97,36 +97,51 @@ func defaultErrorFunction(response *http.Response) error {
 //	httpErr := httperror.ErrorFromStatus(response.StatusCode)
 //	yourErr := ...
 //	return fmt.Errorf("%w: %w", httpErr, yourErr)
-func (c *Client) Do(ctx context.Context, method string, path string, input any, output any, options ...Option) error {
-	requestConfig := RequestConfig{
-		Header:          http.Header{},
-		QueryParameters: url.Values{},
-		HTTPClient:      &c.httpClient,
-	}
-	for _, option := range c.Options {
-		option(&requestConfig)
-	}
+func (c *clientStruct) Do(ctx context.Context, method string, path string, input any, output any, options ...Option) error {
+	requestConfig := c.Config()
 	for _, option := range options {
 		option(&requestConfig)
-	}
-	if requestConfig.HTTPClient == nil {
-		requestConfig.HTTPClient = &c.httpClient
 	}
 
 	var reader io.Reader
 	if input != nil {
 		contentType := requestConfig.Header.Get("Content-Type")
-		if contentType == "" {
-			contentType = "application/json"
-			requestConfig.Header.Set("Content-Type", contentType)
-		}
 
 		if rawBytes, ok := input.(RawBytes); ok {
+			if contentType == "" {
+				contentType = "application/json"
+				requestConfig.Header.Set("Content-Type", contentType)
+			}
+
 			reader = bytes.NewReader(rawBytes)
 		} else if rawBytes, ok := input.(*RawBytes); ok {
+			if contentType == "" {
+				contentType = "application/json"
+				requestConfig.Header.Set("Content-Type", contentType)
+			}
+
 			reader = bytes.NewReader(*rawBytes)
+		} else if urlValues, ok := input.(url.Values); ok {
+			if contentType == "" {
+				contentType = "application/x-www-form-urlencoded"
+				requestConfig.Header.Set("Content-Type", contentType)
+			}
+
+			reader = bytes.NewReader([]byte(urlValues.Encode()))
+		} else if urlValues, ok := input.(*url.Values); ok {
+			if contentType == "" {
+				contentType = "application/x-www-form-urlencoded"
+				requestConfig.Header.Set("Content-Type", contentType)
+			}
+
+			reader = bytes.NewReader([]byte(urlValues.Encode()))
 		} else {
 			inputValue := reflect.ValueOf(input)
+
+			if contentType == "" {
+				contentType = "application/json"
+				requestConfig.Header.Set("Content-Type", contentType)
+			}
 
 			switch true {
 			case strings.HasPrefix(contentType, "application/json"):
@@ -159,7 +174,7 @@ func (c *Client) Do(ctx context.Context, method string, path string, input any, 
 	if strings.Contains(path, "://") {
 		targetURL = path
 	} else {
-		targetURL = strings.TrimRight(c.BaseURL, "/")
+		targetURL = strings.TrimRight(requestConfig.BaseURL, "/")
 		if strings.TrimLeft(path, "/") != "" {
 			targetURL += "/" + strings.TrimLeft(path, "/")
 		}
@@ -185,162 +200,107 @@ func (c *Client) Do(ctx context.Context, method string, path string, input any, 
 		}
 	}
 
-	if dumpDirectory := os.Getenv("RESTAPICLIENT_DUMP_DIRECTORY"); dumpDirectory != "" {
-		filename := fmt.Sprintf("%d_%s_%s", time.Now().Unix(), method, targetURL)
-		{
-			reg, _ := regexp.Compile("[^a-zA-Z0-9_ -]+")
-			filename = reg.ReplaceAllString(filename, "_")
+	retryCount := 0
+	_, err = backoff.Retry(ctx, func() (bool, error) {
+		response, err := func() (*http.Response, error) {
+			dumpRequestIfEnabled(ctx, request)
 
-			if len(filename) > 200 {
-				filename = filename[:200]
-			}
-		}
-
-		{
-			dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".request.head"
-			dumpContents, err := httputil.DumpRequest(request, false)
+			slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Making request [retry %d]: %s %s %v", retryCount, method, targetURL, request.Header))
+			response, err := requestConfig.HTTPClient.Do(request)
 			if err != nil {
-				// Oh well.
-				slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump request to %q: %v", dumpFile, err))
+				return nil, err
 			}
 
-			if dumpDirectory == "-" {
-				fmt.Fprintf(os.Stderr, "%s\n", string(dumpContents))
-			} else {
-				err = os.WriteFile(dumpFile, dumpContents, 0644)
-				if err != nil {
-					// Oh well.
-					slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump request contents to %q: %v", dumpFile, err))
-				}
-			}
+			dumpResponseIfEnabled(ctx, response)
+
+			return response, nil
+		}()
+		// If we failed at any point so far, then this is a permanent error; we can't retry it.
+		if err != nil {
+			return false, backoff.Permanent(err)
 		}
-		{
-			if request.Body != nil {
-				requestBody, err := io.ReadAll(request.Body)
-				if err != nil {
-					// Oh well.
-					slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not read request body: %v", err))
-				} else {
-					// Restore the request body so the next request can use it.
-					request.Body = io.NopCloser(bytes.NewReader(requestBody))
 
-					if dumpDirectory == "-" {
-						fmt.Fprintf(os.Stderr, "%s\n", string(requestBody))
+		contents, err := io.ReadAll(response.Body)
+		if err != nil {
+			return false, backoff.Permanent(err)
+		}
+
+		if response.StatusCode >= 200 && response.StatusCode <= 299 {
+			err := func() error {
+				if output != nil {
+					if rawBytes, ok := output.(*RawBytes); ok {
+						*rawBytes = contents
 					} else {
-						dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".request.body"
-						err = os.WriteFile(dumpFile, requestBody, 0644)
-						if err != nil {
-							// Oh well.
-							slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump request contents to %q: %v", dumpFile, err))
+						outputValue := reflect.ValueOf(output)
+						if outputValue.Kind() != reflect.Pointer {
+							return fmt.Errorf("%w: not a pointer: %T", ErrClientInvalidOutput, output)
+						}
+						outputValue = outputValue.Elem()
+
+						contentType := response.Header.Get("Content-Type")
+						switch true {
+						case strings.HasPrefix(contentType, "application/json"):
+							err = json.Unmarshal(contents, output)
+							if err != nil {
+								return fmt.Errorf("%w: could not deserialize JSON: %w", ErrClientInvalidOutput, err)
+							}
+						case strings.HasPrefix(contentType, "text/"):
+							if outputValue.Kind() == reflect.String {
+								outputValue.SetString(string(contents))
+							} else if outputValue.Type().String() == "[]uint8" {
+								outputValue.SetBytes(contents)
+							} else {
+								return fmt.Errorf("%w: invalid type for content type %s: %T", ErrClientInvalidOutput, contentType, outputValue.Type().String())
+							}
+						default:
+							return fmt.Errorf("%w: unhandled content type: %s", ErrClientInvalidOutput, contentType)
 						}
 					}
 				}
-			}
-		}
-	}
 
-	slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Making request: %s %s %v", method, targetURL, request.Header))
-	response, err := requestConfig.HTTPClient.Do(request)
-	if err != nil {
-		return err
-	}
-
-	contents, err := io.ReadAll(response.Body)
-	if err != nil {
-		return err
-	}
-
-	if dumpDirectory := os.Getenv("RESTAPICLIENT_DUMP_DIRECTORY"); dumpDirectory != "" {
-		filename := fmt.Sprintf("%d_%s_%s", time.Now().Unix(), method, targetURL)
-		{
-			reg, _ := regexp.Compile("[^a-zA-Z0-9_ -]+")
-			filename = reg.ReplaceAllString(filename, "_")
-
-			if len(filename) > 200 {
-				filename = filename[:200]
-			}
-		}
-
-		{
-			dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".response.head"
-			dumpContents, err := httputil.DumpResponse(response, false)
+				return nil
+			}()
 			if err != nil {
-				// Oh well.
-				slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump response to %q: %v", dumpFile, err))
+				return false, backoff.Permanent(err)
 			}
-
-			if dumpDirectory == "-" {
-				fmt.Fprintf(os.Stderr, "%s\n", string(dumpContents))
-			} else {
-				err = os.WriteFile(dumpFile, dumpContents, 0644)
-				if err != nil {
-					// Oh well.
-					slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump response contents to %q: %v", dumpFile, err))
-				}
-			}
+			return true, nil
 		}
-		if dumpDirectory == "-" {
-			fmt.Fprintf(os.Stderr, "%s\n", string(contents))
-		} else {
-			dumpFile := dumpDirectory + string(filepath.Separator) + filename + ".response.body"
-			err = os.WriteFile(dumpFile, contents, 0644)
-			if err != nil {
-				// Oh well.
-				slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("Could not dump response contents to %q: %v", dumpFile, err))
-			}
-		}
-	}
 
-	if response.StatusCode >= 200 && response.StatusCode <= 299 {
-		if output != nil {
-			if rawBytes, ok := output.(*RawBytes); ok {
-				*rawBytes = contents
-			} else {
-				outputValue := reflect.ValueOf(output)
-				if outputValue.Kind() != reflect.Pointer {
-					return fmt.Errorf("%w: not a pointer: %T", ErrClientInvalidOutput, output)
-				}
-				outputValue = outputValue.Elem()
-
-				contentType := response.Header.Get("Content-Type")
-				switch true {
-				case strings.HasPrefix(contentType, "application/json"):
-					err = json.Unmarshal(contents, output)
-					if err != nil {
-						return fmt.Errorf("%w: could not deserialize JSON: %w", ErrClientInvalidOutput, err)
-					}
-				case strings.HasPrefix(contentType, "text/"):
-					if outputValue.Kind() == reflect.String {
-						outputValue.SetString(string(contents))
-					} else if outputValue.Type().String() == "[]uint8" {
-						outputValue.SetBytes(contents)
-					} else {
-						return fmt.Errorf("%w: invalid type for content type %s: %T", ErrClientInvalidOutput, contentType, outputValue.Type().String())
-					}
-				default:
-					return fmt.Errorf("%w: unhandled content type: %s", ErrClientInvalidOutput, contentType)
-				}
-			}
-		}
-		return nil
-	}
-
-	// Figure out what error we want to return before handing it off to the custom function.
-	//
-	// There's a *chance* that the custom function could alter the response to change its error
-	// code and then return nil, so we want to compute ours first, just in case.
-	defaultErr := defaultErrorFunction(response)
-	if requestConfig.ErrorFunction != nil {
 		// Restore the response body so the custom error handler can parse it.
 		response.Body = io.NopCloser(bytes.NewReader(contents))
 
-		// If the user provided a custom error function, then use it.
-		err = requestConfig.ErrorFunction(response)
-		if err != nil {
-			return err
+		// Figure out what error we want to return before handing it off to the custom function.
+		//
+		// There's a *chance* that the custom function could alter the response to change its error
+		// code and then return nil, so we want to compute ours first, just in case.
+		err = func() error {
+			defaultErr := defaultErrorFunction(response)
+			if requestConfig.ErrorFunction != nil {
+				// If the user provided a custom error function, then use it.
+				err = requestConfig.ErrorFunction(response)
+				if err != nil {
+					return err
+				}
+				// For whatever reason, the custom function did not actually provide an error.
+				// Return the default error instead.
+			}
+			return defaultErr
+		}()
+
+		slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("BackoffIsPermanentErrorFunction: %t", requestConfig.BackOffIsPermanentErrorFunction != nil))
+		retryCount++
+		if requestConfig.BackOffIsPermanentErrorFunction != nil {
+			isPermanentError := requestConfig.BackOffIsPermanentErrorFunction(err)
+			slog.LogAttrs(ctx, slog.LevelDebug, fmt.Sprintf("BackoffIsPermanentErrorFunction is set.  Error: %v.  Permanent: %t", err, isPermanentError))
+			if isPermanentError {
+				return false, backoff.Permanent(err)
+			}
+			return false, err
 		}
-		// For whatever reason, the custom function did not actually provide an error.
-		// Return the default error instead.
+		return false, backoff.Permanent(err)
+	}, requestConfig.BackOffOptions...)
+	if err != nil {
+		return err
 	}
-	return defaultErr
+	return nil
 }
