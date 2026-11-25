@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/cenkalti/backoff/v5"
 	"github.com/tekkamanendless/httperror"
@@ -41,8 +42,8 @@ func New(options ...Option) Client {
 func (c *clientStruct) Config() RequestConfig {
 	requestConfig := RequestConfig{
 		BackOffIsPermanentErrorFunction: nil, // There is no permanent error function.
-		BackOffOptions:                  nil, // There are no backoff options.
-		BaseURL:                         "",  // There is no base URL.
+		BackOffOptions:                  []backoff.RetryOption{backoff.WithMaxElapsedTime(1 * time.Minute)},
+		BaseURL:                         "", // There is no base URL.
 		Header:                          http.Header{},
 		QueryParameters:                 url.Values{},
 		HTTPClient:                      &http.Client{},
@@ -190,7 +191,7 @@ func (c *clientStruct) Do(ctx context.Context, method string, path string, input
 
 	request, err := http.NewRequest(method, targetURL, reader)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: could not create request: %w", ErrClient, err)
 	}
 	for key, values := range requestConfig.Header {
 		request.Header.Del(key)
